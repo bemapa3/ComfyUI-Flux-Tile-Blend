@@ -2,32 +2,22 @@ import torch
 import math
 import torch.nn.functional as F
 
-# Helper function to create high-order Smoothstep mask for v3.0 blend
 def create_smoothstep_mask(TH, TW, overlap, device):
     mask = torch.ones((TH, TW), device=device)
     if overlap > 0:
         linspace = torch.linspace(0, 1, overlap, device=device)
-        # 3.0 Blend: Smoothstep (3x^2 - 2x^3) - Sharper than Cosine, still invisible
         fade = 3 * linspace**2 - 2 * linspace**3
-        
         mask[:overlap, :] *= fade.view(-1, 1)
         mask[-overlap:, :] *= fade.flip(0).view(-1, 1)
         mask[:, :overlap] *= fade.view(1, -1)
         mask[:, -overlap:] *= fade.flip(0).view(1, -1)
-    
-    return mask.view(1, TH, TW, 1) # Expand once, avoid repeat ops
+    return mask.view(1, TH, TW, 1)
 
-# Edge-preserving unsharp mask for post-process sharpening
 def unsharp_mask(image, kernel_size=3, strength=0.3):
-    # Image is [B, H, W, C]. Must permute for F.avg_pool2d which is B, C, H, W
     img_perm = image.permute(0, 3, 1, 2)
-    # Average blur to create local mean
     blurred = F.avg_pool2d(img_perm, kernel_size=kernel_size, stride=1, padding=kernel_size//2, count_include_pad=False)
-    # Residual high-frequency detail
     high_freq = img_perm - blurred
-    # Add a percentage of high freq detail back to image
     sharpened = img_perm + strength * high_freq
-    # Trả về trục cũ
     return sharpened.permute(0, 2, 3, 1).clamp(0, 1)
 
 class FluxAutoTiler:
@@ -53,14 +43,12 @@ class FluxAutoTiler:
         nx = math.ceil((W - overlap) / stride) if W > tile_size else 1
         ny = math.ceil((H - overlap) / stride) if H > tile_size else 1
         
-        # padding lưới ảo hoàn hảo (Padded Size)
         padded_W = (nx - 1) * stride + tile_size
         padded_H = (ny - 1) * stride + tile_size
         
         pad_right = max(0, padded_W - W)
         pad_bottom = max(0, padded_H - H)
         
-        # Độn thêm pixel (Replicate)
         if pad_right > 0 or pad_bottom > 0:
             img_permuted = image.permute(0, 3, 1, 2)
             img_padded = F.pad(img_permuted, (0, pad_right, 0, pad_bottom), mode='replicate')
@@ -84,8 +72,10 @@ class FluxAutoStitcher:
                 "orig_width": ("INT", {"default": 2048}),
                 "orig_height": ("INT", {"default": 2048}),
                 "overlap": ("INT", {"default": 128}),
-                # NÂNG CẤP: Chỉnh độ nét hậu kỳ (Post-Process Sharpness)
                 "sharpen_final": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # NÂNG CẤP: Thông số vi chỉnh Pixel (Pixel Nudge)
+                "nudge_x": ("INT", {"default": 0, "min": -10, "max": 10, "step": 1}),
+                "nudge_y": ("INT", {"default": 0, "min": -10, "max": 10, "step": 1}),
             },
         }
 
@@ -93,7 +83,7 @@ class FluxAutoStitcher:
     FUNCTION = "stitch_image"
     CATEGORY = "Flux/AutoTile"
 
-    def stitch_image(self, tiles, grid_x, grid_y, orig_width, orig_height, overlap, sharpen_final):
+    def stitch_image(self, tiles, grid_x, grid_y, orig_width, orig_height, overlap, sharpen_final, nudge_x, nudge_y):
         B, TH, TW, C = tiles.shape
         stride_x = TW - overlap
         stride_y = TH - overlap
@@ -104,7 +94,6 @@ class FluxAutoStitcher:
         output = torch.zeros((1, padded_H, padded_W, C), device=tiles.device)
         weight_map = torch.zeros((1, padded_H, padded_W, C), device=tiles.device)
         
-        # NÂNG CẤP: S-Curve Smoothstep Blend v3.0 cho viền cực sắc
         mask = create_smoothstep_mask(TH, TW, overlap, tiles.device).expand(1, TH, TW, C)
         
         idx = 0
@@ -119,12 +108,24 @@ class FluxAutoStitcher:
 
         final_image = output / (weight_map + 1e-8)
         
-        # Cắt bỏ phần rìa dư thừa
         final_image = final_image[:, :orig_height, :orig_width, :]
 
-        # NÂNG CẤP MỚI: Áp dụng Lọc Nét Hậu Kỳ để "đanh" lại chi tiết
+        # XỬ LÝ NUDGE: Đẩy ảnh về đúng vị trí gốc
+        if nudge_x != 0 or nudge_y != 0:
+            final_image = torch.roll(final_image, shifts=(nudge_y, nudge_x), dims=(1, 2))
+            
+            # Khóa viền: Ngăn không cho pixel bên này chạy vòng sang bên kia khi dịch chuyển
+            if nudge_x > 0:
+                final_image[:, :, :nudge_x, :] = final_image[:, :, nudge_x:nudge_x+1, :]
+            elif nudge_x < 0:
+                final_image[:, :, nudge_x:, :] = final_image[:, :, nudge_x-1:nudge_x, :]
+                
+            if nudge_y > 0:
+                final_image[:, :nudge_y, :, :] = final_image[:, nudge_y:nudge_y+1, :, :]
+            elif nudge_y < 0:
+                final_image[:, nudge_y:, :, :] = final_image[:, nudge_y-1:nudge_y, :, :]
+
         if sharpen_final > 0:
-            # Subtle, edge-preserving unsharp mask
             final_image = unsharp_mask(final_image, kernel_size=3, strength=sharpen_final)
         
         return (final_image,)
