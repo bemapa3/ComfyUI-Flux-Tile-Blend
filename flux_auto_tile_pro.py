@@ -4,27 +4,32 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 
+# ECC alignment helper function using OpenCV
 def ecc_align(source_img, reference_img, warp_mode=cv2.MOTION_TRANSLATION, termination_eps=1e-7, number_of_iterations=5000):
+    # Convert PyTorch tensors to grayscale NumPy arrays for OpenCV
     src_np = cv2.cvtColor((source_img[0].cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     ref_np = cv2.cvtColor((reference_img[0].cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     
+    # Initialize warp matrix
     if warp_mode == cv2.MOTION_HOMOGRAPHY:
         warp_matrix = np.eye(3, 3, dtype=np.float32)
     else:
         warp_matrix = np.eye(2, 3, dtype=np.float32)
     
+    # Define termination criteria
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations, termination_eps)
     
     try:
+        # Run ECC alignment to find the transformation matrix
         (cc, warp_matrix) = cv2.findTransformECC(ref_np, src_np, warp_matrix, warp_mode, criteria, inputMask=None, gaussFiltSize=1)
-        if warp_mode == cv2.MOTION_HOMOGRAPHY:
-            return -warp_matrix[0, 2], -warp_matrix[1, 2]
-        else:
-            return -warp_matrix[0, 2], -warp_matrix[1, 2]
+        
+        # We only need translation x and y. OpenCV translation sign is flipped relative to torch.roll
+        return warp_matrix[0, 2], warp_matrix[1, 2] # Corrected return values (no negation)
     except cv2.error as e:
         print(f"FluxAutoAligner Error: {e}. Check image clarity and content for alignment features.")
-        return 0, 0
+        return 0, 0 # Return no shift on failure
 
+# S-Curve v3.0 Blend helper
 def create_smoothstep_mask(TH, TW, overlap, device):
     mask = torch.ones((TH, TW), device=device)
     if overlap > 0:
@@ -36,6 +41,7 @@ def create_smoothstep_mask(TH, TW, overlap, device):
         mask[:, -overlap:] *= fade.flip(0).view(1, -1)
     return mask.view(1, TH, TW, 1)
 
+# Post-process sharpen helper
 def unsharp_mask(image, kernel_size=3, strength=0.3):
     img_perm = image.permute(0, 3, 1, 2)
     blurred = F.avg_pool2d(img_perm, kernel_size=kernel_size, stride=1, padding=kernel_size//2, count_include_pad=False)
@@ -91,6 +97,7 @@ class FluxAutoStitcher:
                 "overlap": ("INT", {"default": 128}),
                 "sharpen_final": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
+            # Optional inputs (added auto/manual aligner)
             "optional": {
                 "reference_image": ("IMAGE",),
                 "auto_align_ecc": ("BOOLEAN", {"default": False, "label_on": "Bật ECC Alignment", "label_off": "Tắt ECC Alignment"}),
@@ -114,6 +121,7 @@ class FluxAutoStitcher:
         weight_map = torch.zeros((1, padded_H, padded_W, C), device=tiles.device)
         mask = create_smoothstep_mask(TH, TW, overlap, tiles.device).expand(1, TH, TW, C)
         
+        # Normal stitching
         idx = 0
         for y in range(grid_y):
             for x in range(grid_x):
@@ -124,21 +132,47 @@ class FluxAutoStitcher:
                 weight_map[:, y_start:y_start+TH, x_start:x_start+TW, :] += mask
                 idx += 1
 
+        # Calculate final stitched image before optional shifts
         final_image = output / (weight_map + 1e-8)
         final_image = final_image[:, :orig_height, :orig_width, :]
         
+        # ALIGNMENT HANDLING (Bản v5.1 Fix Vênh Scale)
         shift_x, shift_y = 0, 0
+        final_shift_x = manual_nudge_x
+        final_shift_y = manual_nudge_y
+        
+        # Chạy Auto Align nếu có ảnh reference
         if auto_align_ecc and reference_image is not None:
-            shift_x, shift_y = ecc_align(final_image, reference_image)
-            final_shift_x = int(round(shift_x)) + manual_nudge_x
-            final_shift_y = int(round(shift_y)) + manual_nudge_y
-        else:
-            final_shift_x = manual_nudge_x
-            final_shift_y = manual_nudge_y
+            # FIX VÊNH SCALE: Đảm bảo ảnh reference bự bằng ảnh output trước khi so sánh
+            out_H, out_W = final_image.shape[1], final_image.shape[2]
+            
+            # Squeeze reference to handle different batch sizes if necessary
+            ref_single = reference_image[0:1]
+            
+            # Interpolate to final size (using Area mode for quality downscaling, Bilinear for upscale)
+            if ref_single.shape[1] > out_H: # Downscaling needed
+                ref_resized = F.interpolate(ref_single.permute(0, 3, 1, 2), size=(out_H, out_W), mode='area')
+            else: # Upscaling or same size
+                ref_resized = F.interpolate(ref_single.permute(0, 3, 1, 2), size=(out_H, out_W), mode='bilinear', align_corners=False)
+            
+            reference_image_final = ref_resized.permute(0, 2, 3, 1)
+            
+            # Call ecc_align on the SCALED images
+            auto_x, auto_y = ecc_align(final_image, reference_image_final)
+            
+            # Combined shift (Add auto result to manual base)
+            final_shift_x += int(round(auto_x))
+            final_shift_y += int(round(auto_y))
+            
+            # Update outputs with the automatic part for feedback
+            shift_x, shift_y = int(round(auto_x)), int(round(auto_y))
+            print(f"FluxAutoAligner Result: Auto={shift_x},{shift_y}, Manual={manual_nudge_x},{manual_nudge_y}. Final={final_shift_x},{final_shift_y}")
 
+        # Áp dụng dịch chuyển (Apply total final shift)
         if final_shift_x != 0 or final_shift_y != 0:
             final_image = torch.roll(final_image, shifts=(final_shift_y, final_shift_x), dims=(1, 2))
             
+            # Khóa viền (Fix edges by replicating adjacent pixels)
             if final_shift_x > 0:
                 final_image[:, :, :final_shift_x, :] = final_image[:, :, final_shift_x:final_shift_x+1, :]
             elif final_shift_x < 0:
@@ -151,6 +185,7 @@ class FluxAutoStitcher:
         if sharpen_final > 0:
             final_image = unsharp_mask(final_image, kernel_size=3, strength=sharpen_final)
         
+        # Return total shifts actually applied (Auto + Manual combined)
         return (final_image, final_shift_x, final_shift_y)
 
 NODE_CLASS_MAPPINGS = {
