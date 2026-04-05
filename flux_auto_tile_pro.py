@@ -5,33 +5,24 @@ import numpy as np
 import cv2
 
 def advanced_align(source_img, reference_img):
-    """
-    Titan Aligner v6.0: Kết hợp Gaussian Blur và Phase Correlation 
-    để trị dứt điểm lỗi bóng ma trên ảnh Archviz.
-    """
-    # 1. Convert sang Numpy Gray
+    """Titan Aligner v6.0: Gaussian Blur + Phase Correlation (vẫn dùng để gắp tổng thể)"""
     src_np = (source_img[0].cpu().numpy() * 255).astype(np.uint8)
     ref_np = (reference_img[0].cpu().numpy() * 255).astype(np.uint8)
     src_gray = cv2.cvtColor(src_np, cv2.COLOR_RGB2GRAY)
     ref_gray = cv2.cvtColor(ref_np, cv2.COLOR_RGB2GRAY)
-
-    # 2. Làm mịn ảnh (Gaussian Blur) để AI không bị lừa bởi mấy chi tiết nhiễu của AI render
     src_blur = cv2.GaussianBlur(src_gray, (5, 5), 0)
     ref_blur = cv2.GaussianBlur(ref_gray, (5, 5), 0)
 
     try:
-        # 3. Sử dụng Phase Correlation để tìm độ lệch Displacement cực nhanh và chính xác
-        # Thuật toán này cực mạnh trong việc xử lý lệch lớn (như hình ní bị)
+        # Phase Correlation để trị lệch lớn
         shift, response = cv2.phaseCorrelate(ref_blur.astype(np.float32), src_blur.astype(np.float32))
         sx, sy = shift
-        
-        # Kiểm tra nếu kết quả quá ảo (vượt quá 50px) thì dùng ECC cứu cánh
-        if abs(sx) > 50 or abs(sy) > 50:
+        # ECC cứu cánh nếu Phase quá ảo (>30px)
+        if abs(sx) > 30 or abs(sy) > 30:
             warp_matrix = np.eye(2, 3, dtype=np.float32)
-            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 500, 1e-5)
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 300, 1e-5)
             _, warp_matrix = cv2.findTransformECC(ref_blur, src_blur, warp_matrix, cv2.MOTION_TRANSLATION, criteria)
             sx, sy = warp_matrix[0, 2], warp_matrix[1, 2]
-
         return sx, sy
     except:
         return 0, 0
@@ -95,7 +86,9 @@ class FluxAutoStitcher:
             },
             "optional": {
                 "reference_image": ("IMAGE",),
-                "auto_align": ("BOOLEAN", {"default": True, "label_on": "Bật Titan Align v6.0", "label_off": "Tắt Align"}),
+                "auto_align": ("BOOLEAN", {"default": True, "label_on": "Bật Align", "label_off": "Tắt Align"}),
+                "protect_edges": ("BOOLEAN", {"default": False, "label_on": "Bật Bảo Vệ Góc Rìa", "label_off": "Tắt Bảo Vệ"}),
+                "edge_size": ("INT", {"default": 32, "min": 8, "max": 128, "step": 8, "label": "Độ sâu góc vá (px)"}),
                 "manual_nudge_x": ("INT", {"default": 0, "min": -50, "max": 50, "step": 1}),
                 "manual_nudge_y": ("INT", {"default": 0, "min": -50, "max": 50, "step": 1}),
             }
@@ -105,7 +98,7 @@ class FluxAutoStitcher:
     FUNCTION = "stitch_image"
     CATEGORY = "Flux/AutoTile"
 
-    def stitch_image(self, tiles, grid_x, grid_y, orig_width, orig_height, overlap, sharpen_final, reference_image=None, auto_align=True, manual_nudge_x=0, manual_nudge_y=0):
+    def stitch_image(self, tiles, grid_x, grid_y, orig_width, orig_height, overlap, sharpen_final, reference_image=None, auto_align=True, protect_edges=False, edge_size=32, manual_nudge_x=0, manual_nudge_y=0):
         B, TH, TW, C = tiles.shape
         stride_x, stride_y = TW - overlap, TH - overlap
         padded_W, padded_H = (grid_x - 1) * stride_x + TW, (grid_y - 1) * stride_y + TH
@@ -123,11 +116,15 @@ class FluxAutoStitcher:
 
         final_image = (output / (weight_map + 1e-8))[:, :orig_height, :orig_width, :]
         
-        final_shift_x, final_shift_y = manual_nudge_x, manual_nudge_y
-        
-        if auto_align and reference_image is not None:
-            # Resize ref image để so khớp (Fix scale mismatch)
+        # 1. Resize ref image (Fix scale mismatch) để so khớp
+        if reference_image is not None:
             ref_resized = F.interpolate(reference_image[0:1].permute(0, 3, 1, 2), size=(orig_height, orig_width), mode='bilinear').permute(0, 2, 3, 1)
+        else:
+            ref_resized = None
+
+        # 2. Titan Align v6.0 (Gắp tổng thể)
+        final_shift_x, final_shift_y = manual_nudge_x, manual_nudge_y
+        if auto_align and ref_resized is not None:
             auto_x, auto_y = advanced_align(final_image, ref_resized)
             final_shift_x += int(round(auto_x))
             final_shift_y += int(round(auto_y))
@@ -135,6 +132,31 @@ class FluxAutoStitcher:
 
         if final_shift_x != 0 or final_shift_y != 0:
             final_image = torch.roll(final_image, shifts=(final_shift_y, final_shift_x), dims=(1, 2))
+
+        # 🚀 3. THE GUARDIAN v7.0: Vá góc rìa bằng ảnh gốc
+        if protect_edges and ref_resized is not None:
+            # Tạo mask SmoothStep để vá góc cho mượt
+            linspace = torch.linspace(0, 1, edge_size, device=tiles.device)
+            fade = 3 * linspace**2 - 2 * linspace**3
+            
+            # Cắt và dán 4 góc của ảnh reference (đã resize) đè lên ảnh final
+            # Góc Trên Trái (Top-Left)
+            fade_tl = fade.view(-1, 1).expand(edge_size, edge_size) * fade.view(1, -1).expand(edge_size, edge_size)
+            final_image[:, :edge_size, :edge_size, :] = (final_image[:, :edge_size, :edge_size, :] * (1 - fade_tl.view(1, edge_size, edge_size, 1))) + (ref_resized[:, :edge_size, :edge_size, :] * fade_tl.view(1, edge_size, edge_size, 1))
+            
+            # Góc Trên Phải (Top-Right)
+            fade_tr = fade.view(-1, 1).expand(edge_size, edge_size) * fade.flip(0).view(1, -1).expand(edge_size, edge_size)
+            final_image[:, :edge_size, -edge_size:, :] = (final_image[:, :edge_size, -edge_size:, :] * (1 - fade_tr.view(1, edge_size, edge_size, 1))) + (ref_resized[:, :edge_size, -edge_size:, :] * fade_tr.view(1, edge_size, edge_size, 1))
+
+            # Góc Dưới Trái (Bottom-Left)
+            fade_bl = fade.flip(0).view(-1, 1).expand(edge_size, edge_size) * fade.view(1, -1).expand(edge_size, edge_size)
+            final_image[:, -edge_size:, :edge_size, :] = (final_image[:, -edge_size:, :edge_size, :] * (1 - fade_bl.view(1, edge_size, edge_size, 1))) + (ref_resized[:, -edge_size:, :edge_size, :] * fade_bl.view(1, edge_size, edge_size, 1))
+            
+            # Góc Dưới Phải (Bottom-Right)
+            fade_br = fade.flip(0).view(-1, 1).expand(edge_size, edge_size) * fade.flip(0).view(1, -1).expand(edge_size, edge_size)
+            final_image[:, -edge_size:, -edge_size:, :] = (final_image[:, -edge_size:, -edge_size:, :] * (1 - fade_br.view(1, edge_size, edge_size, 1))) + (ref_resized[:, -edge_size:, -edge_size:, :] * fade_br.view(1, edge_size, edge_size, 1))
+            
+            print(f"Guardian v7.0: Đã vá 4 góc rìa bằng ảnh gốc với độ sâu {edge_size}px")
 
         if sharpen_final > 0:
             final_image = unsharp_mask(final_image, kernel_size=3, strength=sharpen_final)
