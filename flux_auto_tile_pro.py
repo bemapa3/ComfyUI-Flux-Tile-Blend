@@ -4,35 +4,27 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 
-# ECC alignment helper function using OpenCV
 def ecc_align(source_img, reference_img, warp_mode=cv2.MOTION_TRANSLATION, termination_eps=1e-7, number_of_iterations=5000):
-    # Convert PyTorch tensors to grayscale NumPy arrays for OpenCV
     src_np = cv2.cvtColor((source_img[0].cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     ref_np = cv2.cvtColor((reference_img[0].cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
     
-    # Initialize warp matrix
     if warp_mode == cv2.MOTION_HOMOGRAPHY:
         warp_matrix = np.eye(3, 3, dtype=np.float32)
     else:
         warp_matrix = np.eye(2, 3, dtype=np.float32)
     
-    # Define termination criteria
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations, termination_eps)
     
     try:
-        # Run ECC alignment to find the transformation matrix
         (cc, warp_matrix) = cv2.findTransformECC(ref_np, src_np, warp_matrix, warp_mode, criteria, inputMask=None, gaussFiltSize=1)
-        
-        # We only need translation x and y
         if warp_mode == cv2.MOTION_HOMOGRAPHY:
-            return -warp_matrix[0, 2], -warp_matrix[1, 2] # Extract translation from 3x3
+            return -warp_matrix[0, 2], -warp_matrix[1, 2]
         else:
-            return -warp_matrix[0, 2], -warp_matrix[1, 2] # Extract translation from 2x3
+            return -warp_matrix[0, 2], -warp_matrix[1, 2]
     except cv2.error as e:
         print(f"FluxAutoAligner Error: {e}. Check image clarity and content for alignment features.")
-        return 0, 0 # Return no shift on failure
+        return 0, 0
 
-# S-Curve v3.0 Blend helper
 def create_smoothstep_mask(TH, TW, overlap, device):
     mask = torch.ones((TH, TW), device=device)
     if overlap > 0:
@@ -44,7 +36,6 @@ def create_smoothstep_mask(TH, TW, overlap, device):
         mask[:, -overlap:] *= fade.flip(0).view(1, -1)
     return mask.view(1, TH, TW, 1)
 
-# Post-process sharpen helper
 def unsharp_mask(image, kernel_size=3, strength=0.3):
     img_perm = image.permute(0, 3, 1, 2)
     blurred = F.avg_pool2d(img_perm, kernel_size=kernel_size, stride=1, padding=kernel_size//2, count_include_pad=False)
@@ -100,9 +91,8 @@ class FluxAutoStitcher:
                 "overlap": ("INT", {"default": 128}),
                 "sharpen_final": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
-            # NÂNG CẤP: Bộ công cụ Aligner Hybrid (Auto + Manual)
             "optional": {
-                "reference_image": ("IMAGE",), # Ảnh gốc để so sánh và tự khớp
+                "reference_image": ("IMAGE",),
                 "auto_align_ecc": ("BOOLEAN", {"default": False, "label_on": "Bật ECC Alignment", "label_off": "Tắt ECC Alignment"}),
                 "manual_nudge_x": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1, "label": "Vi chỉnh Ngang X"}),
                 "manual_nudge_y": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1, "label": "Vi chỉnh Dọc Y"}),
@@ -137,26 +127,18 @@ class FluxAutoStitcher:
         final_image = output / (weight_map + 1e-8)
         final_image = final_image[:, :orig_height, :orig_width, :]
         
-        # NÂNG CẤP: XỬ LÝ ALIGNMENT (AUTO & MANUAL)
         shift_x, shift_y = 0, 0
-        
-        # 1. Chạy Auto Align nếu có ảnh reference
         if auto_align_ecc and reference_image is not None:
-            # Ecc_align is CPU-based, so this can take a few seconds
             shift_x, shift_y = ecc_align(final_image, reference_image)
-            # Add subtle offset to total final nudge
             final_shift_x = int(round(shift_x)) + manual_nudge_x
             final_shift_y = int(round(shift_y)) + manual_nudge_y
         else:
-            # Chỉ dùng manual nudge
             final_shift_x = manual_nudge_x
             final_shift_y = manual_nudge_y
 
-        # 2. Áp dụng dịch chuyển
         if final_shift_x != 0 or final_shift_y != 0:
             final_image = torch.roll(final_image, shifts=(final_shift_y, final_shift_x), dims=(1, 2))
             
-            # Khóa viền
             if final_shift_x > 0:
                 final_image[:, :, :final_shift_x, :] = final_image[:, :, final_shift_x:final_shift_x+1, :]
             elif final_shift_x < 0:
@@ -170,3 +152,13 @@ class FluxAutoStitcher:
             final_image = unsharp_mask(final_image, kernel_size=3, strength=sharpen_final)
         
         return (final_image, final_shift_x, final_shift_y)
+
+NODE_CLASS_MAPPINGS = {
+    "FluxAutoTiler": FluxAutoTiler,
+    "FluxAutoStitcher": FluxAutoStitcher
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "FluxAutoTiler": "Tự động chia Tile (Flux)",
+    "FluxAutoStitcher": "Tự động ghép Tile (Flux)"
+}
