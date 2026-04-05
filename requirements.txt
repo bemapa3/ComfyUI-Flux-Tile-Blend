@@ -1,2 +1,6 @@
+einops
+transformers
+accelerate
+safetensors
+piexif
 opencv-python-headless
-numpy
