@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-# --- 1. NODE CHIA LƯỚI (V10 - TRUYỀN THÔNG SỐ CHUẨN) ---
+# --- 1. NODE CHIA LƯỚI (V10 - CẮT CHUẨN & XUẤT THÔNG SỐ) ---
 class FluxAutoTiler:
     @classmethod
     def INPUT_TYPES(s):
@@ -39,11 +39,10 @@ class FluxAutoTiler:
                     tile = F.pad(tile.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), mode='constant', value=0).permute(0, 2, 3, 1)
                 tiles.append(tile)
 
-        # Trả về cả tile_size và overlap để Stitcher dùng tự động
         return (torch.cat(tiles, dim=0), grid_x, grid_y, width, height, tile_size, overlap)
 
 
-# --- 2. NODE GHÉP HÌNH (V11 - ÉP LÒI 100% LỖ CẮM DÂY) ---
+# --- 2. NODE GHÉP HÌNH (V12 - TOÁN HỌC KHỚP 100% VỚI TILER) ---
 class FluxAutoStitcher_AutoV10:
     @classmethod
     def INPUT_TYPES(s):
@@ -51,7 +50,7 @@ class FluxAutoStitcher_AutoV10:
             "required": {
                 "tiles": ("IMAGE",),
                 "reference_image": ("IMAGE",),
-                # Bùa chú "forceInput: True" ép thằng ComfyUI phải nhả lỗ cắm dây ra
+                # forceInput: True ép thành lỗ cắm, chống gõ tay sai lệch
                 "tile_size": ("INT", {"forceInput": True}),
                 "overlap": ("INT", {"forceInput": True}),
             }
@@ -71,16 +70,15 @@ class FluxAutoStitcher_AutoV10:
         grid_y = math.ceil((orig_height - overlap) / (tile_size - overlap))
 
         idx = 0
-        h_step = (orig_height - tile_h) / (grid_y - 1) if grid_y > 1 else 0
-        w_step = (orig_width - tile_w) / (grid_x - 1) if grid_x > 1 else 0
-
         for y in range(grid_y):
             for x in range(grid_x):
                 if idx < batch_size:
-                    y_start = int(round(y * h_step))
-                    x_start = int(round(x * w_step))
-                    y_end = min(y_start + tile_h, orig_height)
-                    x_end = min(x_start + tile_w, orig_width)
+                    # TRỞ VỀ CHÍNH ĐẠO: Dùng đúng công thức của Tiler
+                    y_start = y * (tile_size - overlap)
+                    x_start = x * (tile_size - overlap)
+                    
+                    y_end = min(y_start + tile_size, orig_height)
+                    x_end = min(x_start + tile_size, orig_width)
                     
                     valid_h = y_end - y_start
                     valid_w = x_end - x_start
@@ -91,7 +89,7 @@ class FluxAutoStitcher_AutoV10:
         return (canvas,)
 
 
-# --- 3. NODE VÁ SẸO (V8.0 - CHỐNG NỔ 359GB RAM) ---
+# --- 3. NODE VÁ SẸO (V8.0 - RESIZE TRƯỚC KHI BLUR ĐỂ CHỐNG NỔ RAM 359GB) ---
 class BBB_Frequency_Tile_Fix:
     @classmethod
     def INPUT_TYPES(s):
@@ -117,7 +115,7 @@ class BBB_Frequency_Tile_Fix:
         img_det_t = img_det.permute(0, 3, 1, 2)
         img_orig_t = img_orig.permute(0, 3, 1, 2)
 
-        # Thu nhỏ ảnh để tính toán ánh sáng, RAM nhẹ như lông hồng
+        # Thu nhỏ ảnh 8 lần để quét ánh sáng -> RAM nhẹ như tơ
         scale_factor = 8
         small_h, small_w = max(1, H // scale_factor), max(1, W // scale_factor)
         small_radius = max(1, blur_radius // scale_factor)
@@ -136,8 +134,7 @@ class BBB_Frequency_Tile_Fix:
         
         return (torch.clamp(result_t.permute(0, 2, 3, 1), 0.0, 1.0),)
 
-
-# --- MAPPING HỆ THỐNG DÀNH CHO COMFYUI ---
+# --- MAPPING HỆ THỐNG ---
 NODE_CLASS_MAPPINGS = {
     "FluxAutoTiler": FluxAutoTiler,
     "FluxAutoStitcher_AutoV10": FluxAutoStitcher_AutoV10,
