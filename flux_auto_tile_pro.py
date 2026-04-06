@@ -23,8 +23,6 @@ class FluxAutoTiler:
 
     def tile(self, image, tile_size, overlap):
         batch, height, width, channels = image.shape
-        
-        # Tính toán số lượng grid
         grid_x = math.ceil((width - overlap) / (tile_size - overlap))
         grid_y = math.ceil((height - overlap) / (tile_size - overlap))
         
@@ -36,19 +34,17 @@ class FluxAutoTiler:
                 y_end = min(y_start + tile_size, height)
                 x_end = min(x_start + tile_size, width)
                 
-                # Trích xuất tile và pad nếu thiếu kích thước ở rìa
                 tile = image[:, y_start:y_end, x_start:x_end, :]
                 if tile.shape[1] < tile_size or tile.shape[2] < tile_size:
                     pad_h = tile_size - tile.shape[1]
                     pad_w = tile_size - tile.shape[2]
                     tile = F.pad(tile.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), mode='constant', value=0).permute(0, 2, 3, 1)
-                
                 tiles.append(tile)
         
         return (torch.cat(tiles, dim=0), grid_x, grid_y, width, height)
 
-# --- 2. NODE GHÉP HÌNH (FLUX AUTO STITCHER) ---
-class FluxAutoStitcher:
+# --- 2. NODE GHÉP HÌNH V2 (BẢN FIX LỖI CACHE & THIẾU BIẾN) ---
+class FluxAutoStitcher_V2:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -67,14 +63,9 @@ class FluxAutoStitcher:
     CATEGORY = "BBB-Custom"
 
     def stitch(self, tiles, reference_image, grid_x, grid_y, orig_width, orig_height):
-        # Lấy kích thước thực tế của tile sau khi render (có thể khác tile_size ban đầu)
         batch_size, tile_h, tile_w, channels = tiles.shape
-        
-        # Tạo canvas trống dựa trên kích thước gốc
         canvas = torch.zeros((1, orig_height, orig_width, channels), device=tiles.device)
         
-        # Tính toán bước nhảy chính xác để khớp grid
-        # Đây là bản ghép Fast, ưu tiên ánh sáng từ tâm tile
         idx = 0
         h_step = (orig_height - tile_h) / (grid_y - 1) if grid_y > 1 else 0
         w_step = (orig_width - tile_w) / (grid_x - 1) if grid_x > 1 else 0
@@ -86,10 +77,8 @@ class FluxAutoStitcher:
                     x_start = int(round(x * w_step))
                     y_end = min(y_start + tile_h, orig_height)
                     x_end = min(x_start + tile_w, orig_width)
-                    
                     canvas[0, y_start:y_end, x_start:x_end, :] = tiles[idx, 0:(y_end-y_start), 0:(x_end-x_start), :]
                     idx += 1
-        
         return (canvas,)
 
 # --- 3. SIÊU NODE FIX TILE (BBB FREQUENCY TILE FIX) ---
@@ -98,8 +87,8 @@ class BBB_Frequency_Tile_Fix:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image_detailed": ("IMAGE",), # Ảnh Stitch xong (Nét nhưng lỗi sáng)
-                "image_original": ("IMAGE",), # Ảnh gốc chưa Upscale (Mờ nhưng sáng chuẩn)
+                "image_detailed": ("IMAGE",),
+                "image_original": ("IMAGE",),
                 "blur_radius": ("INT", {"default": 128, "min": 1, "max": 1024, "step": 1}),
                 "detail_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05}),
             }
@@ -111,50 +100,39 @@ class BBB_Frequency_Tile_Fix:
 
     def fix_frequency(self, image_detailed, image_original, blur_radius, detail_boost):
         device = image_detailed.device
-        
-        # Chuyển về float32 để tính toán cực kỳ chính xác cho ảnh 5000px
         img_det = image_detailed.to(torch.float32)
         img_orig = image_original.to(torch.float32)
         
-        # Đảm bảo 2 ảnh cùng kích thước (nếu orig mờ hơn thì resize lên)
         if img_det.shape != img_orig.shape:
             img_orig = F.interpolate(img_orig.permute(0, 3, 1, 2), size=(img_det.shape[1], img_det.shape[2]), mode='bilinear').permute(0, 2, 3, 1)
 
-        # B, H, W, C -> B, C, H, W
         img_det_t = img_det.permute(0, 3, 1, 2)
         img_orig_t = img_orig.permute(0, 3, 1, 2)
         
-        # --- FIX RAM CHỐNG NỔ 359GB: Dùng AvgPool + Padding Reflect ---
         padding = blur_radius
         kernel_size = blur_radius * 2 + 1
         
-        # Lấy lớp ánh sáng "hồn" từ ảnh gốc
         padded_orig = F.pad(img_orig_t, (padding, padding, padding, padding), mode='reflect')
         low_freq = F.avg_pool2d(padded_orig, kernel_size=kernel_size, stride=1)
         
-        # Lấy lớp ánh sáng "lỗi" từ ảnh Tile để tách lấy Chi tiết (High Frequency)
         padded_det = F.pad(img_det_t, (padding, padding, padding, padding), mode='reflect')
         low_freq_det = F.avg_pool2d(padded_det, kernel_size=kernel_size, stride=1)
         
         high_freq = img_det_t - low_freq_det
-        
-        # MIX LẠI: Ánh sáng gốc chuẩn + (Chi tiết nét căng * Hệ số Boost)
         result_t = low_freq + (high_freq * detail_boost)
-        
-        # Trả về định dạng chuẩn (Clamp để tránh cháy sáng)
         result = torch.clamp(result_t.permute(0, 2, 3, 1), 0.0, 1.0)
         
         return (result,)
 
-# --- MAPPING HỆ THỐNG ---
+# --- MAPPING HỆ THỐNG (ĐỔI TÊN ĐỂ ÉP REFRESH CACHE) ---
 NODE_CLASS_MAPPINGS = {
     "FluxAutoTiler": FluxAutoTiler,
-    "FluxAutoStitcher": FluxAutoStitcher,
+    "FluxAutoStitcher_V2": FluxAutoStitcher_V2,
     "BBB_Frequency_Tile_Fix": BBB_Frequency_Tile_Fix
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxAutoTiler": "Flux Auto Tiler (Fast) 🧩",
-    "FluxAutoStitcher": "Flux Auto Stitcher (Fast) 🧵",
+    "FluxAutoStitcher_V2": "Flux Auto Stitcher (Siêu Cấp) 🧵",
     "BBB_Frequency_Tile_Fix": "BBB Frequency Tile Fix 🛠️"
 }
