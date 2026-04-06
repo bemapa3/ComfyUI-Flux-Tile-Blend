@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-# --- 1. NODE CHIA LƯỚI (V10) ---
+# --- 1. NODE CHIA LƯỚI (V10 - Giữ nguyên) ---
 class FluxAutoTiler:
     @classmethod
     def INPUT_TYPES(s):
@@ -36,33 +36,36 @@ class FluxAutoTiler:
                 tiles.append(tile)
         return (torch.cat(tiles, dim=0), grid_x, grid_y, width, height, tile_size, overlap)
 
-# --- 2. NODE TRỘN (V17 - SHARP EDGE & COLOR HARMONY) ---
+# --- 2. NODE TRỘN THÔNG MINH (V16 - SHARP EDGE & COLOR BALANCE) ---
 class BBB_Smart_Photoshop_Mixer:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image_base": ("IMAGE",),         
-                "image_detail": ("IMAGE",),       
+                "image_base": ("IMAGE",),         # Denoise thấp (Xác + Màu chuẩn)
+                "image_detail": ("IMAGE",),       # Denoise cao (Hồn + Chi tiết)
                 "texture_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}),
-                "edge_sharpness": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05}), # Giữ viền đanh
-                "color_harmony": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}), # Giảm để tránh nhòe màu
+                "edge_sharpness_fix": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05}), # Nút mới: Giữ viền đanh
+                "shadow_preserve": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "color_harmony": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}), # Giảm mặc định để tránh nhòe
             }
         }
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "mix"
     CATEGORY = "BBB-Custom"
 
-    def mix(self, image_base, image_detail, texture_strength, edge_sharpness, color_harmony):
+    def mix(self, image_base, image_detail, texture_strength, edge_sharpness_fix, shadow_preserve, color_harmony):
         base = image_base.to(torch.float32).permute(0, 3, 1, 2)
         detail = image_detail.to(torch.float32).permute(0, 3, 1, 2)
         
-        # 1. Bóc High-freq sắc nét (Laplacian)
+        # 1. Bóc chi tiết High-pass sắc nét (Laplacian Operator)
+        # Tui dùng toán học Sobel dò cạnh, né Average Pool ra!
         laplacian_kernel = torch.tensor([[-1,-1,-1], [-1,8,-1], [-1,-1,-1]], dtype=torch.float32, device=base.device).reshape(1,1,3,3).repeat(3,1,1,1)
         high_freq = F.conv2d(detail, laplacian_kernel, padding=1, groups=3)
         
-        # 2. Tạo Edge Mask đanh (Sobel-like)
+        # 2. Tạo Edge Mask đanh (Dò cạnh sắc)
         gray_base = torch.mean(base, dim=1, keepdim=True)
+        # Sobel x, y operator
         edge_x = torch.abs(gray_base[:,:,:,1:] - gray_base[:,:,:,:-1])
         edge_y = torch.abs(gray_base[:,:,1:,:] - gray_base[:,:,:-1,:])
         # Pad lại cho đủ size
@@ -71,19 +74,22 @@ class BBB_Smart_Photoshop_Mixer:
         edge_mask[:,:,:-1,:] += edge_y
         edge_mask = torch.clamp(edge_mask * 15.0, 0.0, 1.0)
         
-        # 3. Trộn màu thông minh (giữ cấu trúc màu nhưng không làm nhòe viền)
-        low_base = F.avg_pool2d(base, kernel_size=3, stride=1, padding=1)
-        low_detail = F.avg_pool2d(detail, kernel_size=3, stride=1, padding=1)
-        color_diff = (low_base - low_detail) * color_harmony
+        # 3. Tạo mặt nạ bảo vệ vùng tối (Shadow Mask)
+        shadow_mask = torch.pow(torch.clamp(gray_base, 0.0, 1.0), shadow_preserve)
         
         # 4. CHỐT: Đắp chi tiết nhưng "né" cái viền ra (Edge Preservation)
         # Chỗ nào có cạnh (edge_mask cao) thì giảm bớt detail đè lên để viền đanh chuẩn 
-        detail_to_add = high_freq * texture_strength * (1.0 - edge_mask * edge_sharpness)
+        detail_to_add = high_freq * texture_strength * (1.0 - edge_mask * edge_sharpness_fix) * shadow_mask
         
-        result = base + detail_to_add + color_diff
+        # 5. Cân bằng màu (giữ cấu trúc màu nhưng không làm nhòe viền)
+        result = base + detail_to_add
+        low_base = F.avg_pool2d(base, kernel_size=3, stride=1, padding=1)
+        low_result = F.avg_pool2d(result, kernel_size=3, stride=1, padding=1)
+        result = result + (low_base - low_result) * color_harmony
+        
         return (torch.clamp(result, 0.0, 1.0).permute(0, 2, 3, 1),)
 
-# --- Các node Stitcher và Frequency Fix giữ nguyên như V16 ---
+# --- 3. NODE GHÉP HÌNH (V13 - Giữ nguyên) ---
 class FluxAutoStitcher_Blend:
     @classmethod
     def INPUT_TYPES(s):
@@ -127,6 +133,7 @@ class FluxAutoStitcher_Blend:
         canvas = canvas / torch.clamp(weights, min=1e-8)
         return (torch.clamp(canvas, 0.0, 1.0),)
 
+# --- 4. NODE VÁ SẸO (V8.0 - Giữ nguyên) ---
 class BBB_Frequency_Tile_Fix:
     @classmethod
     def INPUT_TYPES(s):
@@ -166,5 +173,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxAutoTiler": "Flux Auto Tiler (Fast) V10 🧩",
     "FluxAutoStitcher_Blend": "Flux Auto Stitcher (Feather Blend) 🧵",
     "BBB_Frequency_Tile_Fix": "BBB Frequency Tile Fix 🛠️",
-    "BBB_Smart_Photoshop_Mixer": "Mixer V17 - RAZOR SHARP 🎨"
+    "BBB_Smart_Photoshop_Mixer": "Mixer V16 - SHARP EDGE ULTIMATE 🎨"
 }
