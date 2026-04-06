@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-# --- 1. NODE CHIA LƯỚI (Cắt chuẩn) ---
+# --- 1. NODE CHIA LƯỚI (V10 - TRUYỀN THÔNG SỐ CHUẨN) ---
 class FluxAutoTiler:
     @classmethod
     def INPUT_TYPES(s):
@@ -14,8 +14,8 @@ class FluxAutoTiler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("tiles", "grid_x", "grid_y", "orig_width", "orig_height")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("tiles", "grid_x", "grid_y", "orig_width", "orig_height", "actual_tile_size", "actual_overlap")
     FUNCTION = "tile"
     CATEGORY = "BBB-Custom"
 
@@ -39,18 +39,20 @@ class FluxAutoTiler:
                     tile = F.pad(tile.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), mode='constant', value=0).permute(0, 2, 3, 1)
                 tiles.append(tile)
 
-        return (torch.cat(tiles, dim=0), grid_x, grid_y, width, height)
+        # TRẢ VỀ CẢ TILE_SIZE VÀ OVERLAP ĐỂ STITCHER DÙNG
+        return (torch.cat(tiles, dim=0), grid_x, grid_y, width, height, tile_size, overlap)
 
-# --- 2. NODE GHÉP HÌNH (Dán lại khít khịt 100%) ---
-class FluxAutoStitcher_HoanHao:
+# --- 2. NODE GHÉP HÌNH (V10 - TỰ ĐỘNG CẤU HÌNH THEO DÂY) ---
+class FluxAutoStitcher_AutoV10:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "tiles": ("IMAGE",),
                 "reference_image": ("IMAGE",),
-                "tile_size": ("INT", {"default": 2048, "min": 256, "max": 4096, "step": 64}),
-                "overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 8}),
+                # BỎ MẤY CÁI Ô NHẬP SỐ GÕ TAY, CHUYỂN THÀNH CỔNG CẮM DÂY
+                "tile_size": ("INT",),
+                "overlap": ("INT",),
             }
         }
 
@@ -62,34 +64,39 @@ class FluxAutoStitcher_HoanHao:
         batch_size, tile_h, tile_w, channels = tiles.shape
         batch, orig_height, orig_width, _ = reference_image.shape
 
-        # Lấy nguyên ảnh gốc làm nền, không sợ đen thui
+        # Lấy nguyên ảnh gốc làm nền
         canvas = reference_image.clone()
 
-        # Dùng lại đúng công thức của Tiler
+        # DÙNG LẠI CÔNG THỨC CHUẨN TỪ TILER
         grid_x = math.ceil((orig_width - overlap) / (tile_size - overlap))
         grid_y = math.ceil((orig_height - overlap) / (tile_size - overlap))
 
         idx = 0
+        h_step = (orig_height - tile_h) / (grid_y - 1) if grid_y > 1 else 0
+        w_step = (orig_width - tile_w) / (grid_x - 1) if grid_x > 1 else 0
+
         for y in range(grid_y):
             for x in range(grid_x):
                 if idx < batch_size:
-                    # Tọa độ y chang lúc cắt, không trượt 1 ly
-                    y_start = y * (tile_size - overlap)
-                    x_start = x * (tile_size - overlap)
-
-                    y_end = min(y_start + tile_size, orig_height)
-                    x_end = min(x_start + tile_size, orig_width)
-
-                    # Bỏ phần pad dư thừa, chỉ dán phần ảnh thật
+                    # Tính tọa độ bắt đầu (Làm tròn để tránh lệch pixel)
+                    y_start = int(round(y * h_step))
+                    x_start = int(round(x * w_step))
+                    
+                    # Tọa độ kết thúc (Đảm bảo không vượt quá kích thước ảnh gốc)
+                    y_end = min(y_start + tile_h, orig_height)
+                    x_end = min(x_start + tile_w, orig_width)
+                    
+                    # Cắt bỏ phần pad dư thừa ở rìa Tile
                     valid_h = y_end - y_start
                     valid_w = x_end - x_start
 
+                    # Dán Tile vào, không có kẽ hở cho 'mã vạch'
                     canvas[0, y_start:y_end, x_start:x_end, :] = tiles[idx, 0:valid_h, 0:valid_w, :]
                     idx += 1
 
         return (canvas,)
 
-# --- 3. NODE VÁ SẸO (Chống Nổ 359GB RAM) ---
+# --- 3. NODE VÁ SẸO (Giữ nguyên bản V8.0 chống nổ RAM) ---
 class BBB_Frequency_Tile_Fix:
     @classmethod
     def INPUT_TYPES(s):
@@ -136,12 +143,12 @@ class BBB_Frequency_Tile_Fix:
 # --- MAPPING HỆ THỐNG ---
 NODE_CLASS_MAPPINGS = {
     "FluxAutoTiler": FluxAutoTiler,
-    "FluxAutoStitcher_HoanHao": FluxAutoStitcher_HoanHao,
+    "FluxAutoStitcher_AutoV10": FluxAutoStitcher_AutoV10, # Đổi tên thành AutoV10 cho oai
     "BBB_Frequency_Tile_Fix": BBB_Frequency_Tile_Fix
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FluxAutoTiler": "Flux Auto Tiler (Fast) 🧩",
-    "FluxAutoStitcher_HoanHao": "Flux Auto Stitcher (Chốt Hạ) 🧵",
+    "FluxAutoTiler": "Flux Auto Tiler (Fast) V10 🧩",
+    "FluxAutoStitcher_AutoV10": "Flux Auto Stitcher (Tự Động) 🧵", # Tên hiển thị mới
     "BBB_Frequency_Tile_Fix": "BBB Frequency Tile Fix 🛠️"
 }
