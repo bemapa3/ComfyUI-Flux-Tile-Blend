@@ -164,3 +164,60 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxAutoStitcher_Blend": "Flux Auto Stitcher (Feather Blend) 🧵",
     "BBB_Frequency_Tile_Fix": "BBB Frequency Tile Fix 🛠️"
 }
+# --- 4. NODE THAY THẾ PHOTOSHOP (TRỘN 2 PASS DENOISE) ---
+class BBB_Smart_Photoshop_Mixer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image_base_low_denoise": ("IMAGE",),   # Cắm từ KSampler Denoise 0.2
+                "image_detail_high_denoise": ("IMAGE",), # Cắm từ KSampler Denoise 0.45
+                "texture_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}), # Độ rực của chi tiết
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "transfer_detail"
+    CATEGORY = "BBB-Custom"
+
+    def transfer_detail(self, image_base_low_denoise, image_detail_high_denoise, texture_strength):
+        # Chuyển tensor sang dạng tính toán (B, C, H, W)
+        base = image_base_low_denoise.to(torch.float32).permute(0, 3, 1, 2)
+        detail = image_detail_high_denoise.to(torch.float32).permute(0, 3, 1, 2)
+        
+        # Đồng bộ kích thước nếu lỡ cắm lệch
+        if base.shape != detail.shape:
+            detail = F.interpolate(detail, size=(base.shape[2], base.shape[3]), mode='bilinear')
+
+        # THUẬT TOÁN BÓC TÁCH CHI TIẾT (High-Pass Filter)
+        # Làm mờ ảnh High Denoise để lấy khối tổng thể
+        kernel_size = 5
+        padding = kernel_size // 2
+        low_freq_detail = F.avg_pool2d(detail, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Lấy ảnh High gốc trừ đi ảnh mờ => Ra được các chi tiết gai góc (High Frequency)
+        high_freq_detail = detail - low_freq_detail
+        
+        # THUẬT TOÁN ĐẮP MẶT NẠ (Thay thế Photoshop)
+        # Ụp cái chi tiết gai góc đó lên cái ảnh Base (ảnh có cấu trúc chuẩn)
+        result = base + (high_freq_detail * texture_strength)
+        
+        # Đưa về lại chuẩn màu ComfyUI (B, H, W, C)
+        result = torch.clamp(result, 0.0, 1.0).permute(0, 2, 3, 1)
+        
+        return (result,)
+
+# --- CẬP NHẬT LẠI MAPPING (Chép đè đoạn cuối cùng) ---
+NODE_CLASS_MAPPINGS = {
+    "FluxAutoTiler": FluxAutoTiler,
+    "FluxAutoStitcher_Blend": FluxAutoStitcher_Blend,
+    "BBB_Frequency_Tile_Fix": BBB_Frequency_Tile_Fix,
+    "BBB_Smart_Photoshop_Mixer": BBB_Smart_Photoshop_Mixer # THÊM NODE MỚI VÀO ĐÂY
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "FluxAutoTiler": "Flux Auto Tiler (Fast) V10 🧩",
+    "FluxAutoStitcher_Blend": "Flux Auto Stitcher (Feather Blend) 🧵",
+    "BBB_Frequency_Tile_Fix": "BBB Frequency Tile Fix 🛠️",
+    "BBB_Smart_Photoshop_Mixer": "BBB Smart Photoshop Mixer 🎨" # THÊM TÊN HIỂN THỊ
+}
